@@ -134,3 +134,86 @@ sequenceDiagram
     Advisor-->>Controller: "Ton nom est Chérif."
     Controller-->>Utilisateur: "Ton nom est Chérif."
 ```
+
+---
+
+## 8. Cas pratique pour s'entraîner : Créer un "Professeur d'Anglais" avec mémoire
+
+Voici un exercice complet pour vous entraîner à expliquer ce concept à quelqu'un. Nous allons créer un petit bot qui se souvient des fautes d'anglais de l'utilisateur.
+
+### L'objectif (L'exercice à réaliser) :
+Créer une route d'API `/api/english-teacher` où un utilisateur peut discuter en anglais. Le bot doit se souvenir de la conversation pour pouvoir faire un bilan des erreurs à la fin.
+
+### Le Code (La solution) :
+
+**1. Le contrôleur (EnglishTeacherController.java)**
+```java
+package MeteoAIBot.com;
+
+import org.springframework.ai.chat.client.ChatClient;
+import org.springframework.ai.chat.memory.ChatMemory;
+import org.springframework.web.bind.annotation.GetMapping;
+import org.springframework.web.bind.annotation.RequestParam;
+import org.springframework.web.bind.annotation.RestController;
+
+@RestController
+public class EnglishTeacherController {
+
+    private final ChatClient chatClient;
+    
+    // Le "System Prompt" donne la personnalité à l'IA
+    private static final String SYSTEM_PROMPT = "Tu es un professeur d'anglais strict mais bienveillant. " +
+            "L'utilisateur va te parler en anglais. Corrige ses fautes, explique la règle, " +
+            "et relance la conversation. Garde toujours en mémoire ce qu'il a dit avant.";
+
+    // On utilise le ChatClient configuré avec l'Advisor (mémoire) que nous avons vu plus haut
+    public EnglishTeacherController(ChatClient.Builder builder, ChatMemory chatMemory) {
+        this.chatClient = builder
+                .defaultSystem(SYSTEM_PROMPT)
+                // L'Advisor de mémoire est branché ici !
+                .defaultAdvisors(new org.springframework.ai.chat.client.advisor.MessageChatMemoryAdvisor(chatMemory))
+                .build();
+    }
+
+    /**
+     * @param eleveName C'est notre Session ID ! Il permet de séparer les élèves.
+     * @param message Le message en anglais de l'élève.
+     */
+    @GetMapping(value = "/api/english-teacher", produces = "text/plain;charset=UTF-8")
+    public String discuterAvecLeProf(
+            @RequestParam("eleveName") String eleveName,
+            @RequestParam("message") String message) {
+
+        return chatClient.prompt()
+                .user(message)
+                // On passe le Session ID à l'Advisor pour qu'il retrouve la bonne mémoire
+                .advisors(advisor -> advisor.param(ChatMemory.CONVERSATION_ID, eleveName))
+                .call()
+                .content();
+    }
+}
+```
+
+### Comment tester l'exercice (Le scénario pédagogique) :
+
+Pour tester, vous utilisez Postman ou votre navigateur web, et vous faites plusieurs requêtes d'affilée pour le MÊME `eleveName`.
+
+*   **Requête 1 :** L'élève fait une faute basique.
+    `http://localhost:8081/api/english-teacher?eleveName=marc&message=I is a developer.`
+    *L'IA va répondre : "On dit I am a developer. Que fais-tu comme développement ?"*
+
+*   **Requête 2 :** L'élève répond, sans se présenter de nouveau.
+    `http://localhost:8081/api/english-teacher?eleveName=marc&message=I make websites.`
+    *L'IA va répondre : "Très bien ! Quel langage utilises-tu pour faire des sites web ?"*
+
+*   **Requête 3 : Le test ultime de la mémoire !**
+    `http://localhost:8081/api/english-teacher?eleveName=marc&message=Peux-tu me rappeler la première faute que j'ai faite tout à l'heure ?`
+    
+    *C'est ici que la magie opère ! L'IA va aller lire la base de données (grâce au Session ID `marc`), retrouver le premier message "I is a developer", et répondre : "Oui, tu avais dit 'I is a developer' au lieu de 'I am'."*
+
+### Que se passe-t-il si un autre élève arrive ? (Test du Session ID)
+
+*   **Requête 4 :** Un nouvel élève (Chérif) arrive. On change le Session ID !
+    `http://localhost:8081/api/english-teacher?eleveName=cherif&message=Peux-tu me rappeler ma première faute ?`
+    
+    *L'IA va répondre : "C'est notre premier échange, tu n'as pas encore fait de faute !". La mémoire de "marc" n'est pas mélangée avec celle de "cherif" grâce au `conversation_id` !*
