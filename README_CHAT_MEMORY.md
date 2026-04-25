@@ -49,16 +49,49 @@ L'historique est sauvegardé dans une **Base de données** (comme MySQL, Postgre
 
 ---
 
-## 5. Les Patterns : L'Advisor (Le Conseiller)
+## 5. Comment la donnée est-elle vraiment persistée et retrouvée ? (Le détail en base de données)
+
+Lorsqu'on utilise une mémoire persistante avec H2 (ou une autre base relationnelle SQL) via JDBC dans Spring AI, il y a un travail invisible qui se passe dans les coulisses de la base de données.
+
+### A. Le Schéma de la Base de Données (La structure)
+Pour pouvoir sauvegarder les messages, Spring AI a besoin d'une table SQL spécifique. C'est ce que nous avons défini dans notre fichier `schema-h2db.sql` :
+
+```sql
+CREATE TABLE SPRING_AI_CHAT_MEMORY (
+    conversation_id VARCHAR(36) NOT NULL, -- C'est ici qu'on stocke le Session ID ("cherif")
+    content LONGVARCHAR NOT NULL,         -- C'est le contenu du message ("Je m'appelle cherif")
+    type VARCHAR(10) NOT NULL,            -- C'est l'auteur du message (USER pour vous, ASSISTANT pour l'IA)
+    "timestamp" TIMESTAMP                 -- L'heure exacte du message pour pouvoir les trier par ordre chronologique
+);
+```
+
+### B. Comment la donnée est persistée (Sauvegardée) ?
+Quand vous posez une question ("Bonjour") et que l'IA vous répond ("Bonjour, comment puis-je vous aider ?"), l'Advisor `MessageChatMemoryAdvisor` fait deux requêtes `INSERT` automatiquement (en utilisant JDBC) :
+
+1. Il sauvegarde votre question :
+   `INSERT INTO SPRING_AI_CHAT_MEMORY (conversation_id, content, type) VALUES ('cherif', 'Bonjour', 'USER');`
+2. Il sauvegarde la réponse de l'IA :
+   `INSERT INTO SPRING_AI_CHAT_MEMORY (conversation_id, content, type) VALUES ('cherif', 'Bonjour, comment puis-je vous aider ?', 'ASSISTANT');`
+
+### C. Comment la donnée est retrouvée (Chargée) ?
+Quand vous posez la question suivante, l'Advisor a besoin de retrouver l'historique avant d'appeler l'IA. Il fait alors une requête `SELECT` dans la base de données en filtrant par votre `conversation_id` (votre Session ID) :
+
+`SELECT content, type FROM SPRING_AI_CHAT_MEMORY WHERE conversation_id = 'cherif' ORDER BY timestamp ASC LIMIT 10;`
+
+*(Le `LIMIT 10` correspond justement à la fameuse fenêtre `MessageWindowChatMemory` qui ne prend que les 10 derniers messages pour ne pas tout saturer !)*
+
+---
+
+## 6. Les Patterns : L'Advisor (Le Conseiller)
 Dans le code, on ne modifie pas l'outil principal de l'IA pour lui ajouter une mémoire. On utilise un "Pattern" (une technique de code célèbre) appelé **l'Advisor** (le Conseiller).
 *   Un Advisor est un petit module invisible qui vient se "brancher" sur notre `ChatClient` (notre téléphone vers l'IA).
-*   Il intercepte notre message avant de l'envoyer, va chercher l'historique dans la base de données, l'ajoute discrètement à notre question, puis l'envoie à l'IA.
+*   Il intercepte notre message avant de l'envoyer, va chercher l'historique dans la base de données (comme vu dans la section 5), l'ajoute discrètement à notre question, puis l'envoie à l'IA.
 
 **Voici comment on le branche dans le code de configuration :**
 ```java
 @Bean
 public ChatClient chatClient(ChatClient.Builder builder, ChatMemory chatMemory) {
-    // 1. On fabrique notre "Conseiller" qui va gérer la mémoire
+    // 1. On fabrique notre "Conseiller" qui va gérer la mémoire (il utilisera JDBC pour parler à la BDD)
     Advisor memoryAdvisor = MessageChatMemoryAdvisor.builder(chatMemory).build();
     
     // 2. On branche ce conseiller par défaut sur notre ChatClient
@@ -70,32 +103,33 @@ public ChatClient chatClient(ChatClient.Builder builder, ChatMemory chatMemory) 
 
 ---
 
-## 6. Graphe d'explication : Comment tout cela fonctionne ensemble ?
+## 7. Graphe d'explication : Le cycle complet avec Base de Données
 
-Voici un schéma simple qui montre le cheminement d'une question quand la mémoire (l'Advisor) est activée.
+Voici un schéma simple qui montre le cheminement exact d'une question, de la persistance, et de la récupération de la donnée en base.
 
 ```mermaid
 sequenceDiagram
     actor Utilisateur
     participant Controller as Notre Application (ChatClient)
     participant Advisor as L'Advisor (MessageChatMemoryAdvisor)
-    participant DB as Base de Données (Persistent Memory)
+    participant DB as Base de Données (H2 / SPRING_AI_CHAT_MEMORY)
     participant IA as OpenAI (ChatGPT)
 
-    Utilisateur->>Controller: "Quel est mon nom ?" (Session: cherif_123)
-    Controller->>Advisor: Transmet la question
+    Utilisateur->>Controller: "Quel est mon nom ?" (Session: cherif)
+    Controller->>Advisor: Transmet la question avec param(CONVERSATION_ID, "cherif")
     
-    Note over Advisor,DB: 1. L'Advisor intercepte le message
-    Advisor->>DB: Cherche l'historique pour l'ID "cherif_123"
-    DB-->>Advisor: Retourne l'historique: "L'utilisateur a dit qu'il s'appelle Chérif"
+    Note over Advisor,DB: ETAPE 1: RETROUVER LA DONNEE
+    Advisor->>DB: Exécute: SELECT * WHERE conversation_id = 'cherif' ORDER BY timestamp
+    DB-->>Advisor: Retourne: [USER: "Je m'appelle Chérif"]
     
-    Note over Advisor,IA: 2. L'Advisor combine tout ça
-    Advisor->>IA: "Historique: [Je m'appelle Chérif]. Question: Quel est mon nom ?"
+    Note over Advisor,IA: ETAPE 2: COMBINER
+    Advisor->>IA: Envoie l'historique caché + La nouvelle question ("Quel est mon nom ?")
     
-    IA-->>Advisor: "Ton nom est Chérif."
+    IA-->>Advisor: Répond: "Ton nom est Chérif."
     
-    Note over Advisor,DB: 3. L'Advisor sauvegarde la nouvelle réponse
-    Advisor->>DB: Sauvegarde la question et la réponse pour la prochaine fois
+    Note over Advisor,DB: ETAPE 3: PERSISTER LA DONNEE
+    Advisor->>DB: Exécute: INSERT nouvelle question (USER)
+    Advisor->>DB: Exécute: INSERT nouvelle réponse (ASSISTANT)
     
     Advisor-->>Controller: "Ton nom est Chérif."
     Controller-->>Utilisateur: "Ton nom est Chérif."
